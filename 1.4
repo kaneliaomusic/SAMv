@@ -1,0 +1,849 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <WiFi.h>
+#include <ESPmDNS.h>
+#include <WiFiUdp.h>
+#include <ArduinoOTA.h>
+
+// WiFi credentials (replace with your own)
+const char* ssid = "...";
+const char* password = "...";
+
+// OLED display settings
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// Pin definitions
+const int BUZZER_PIN = 4;    // Passive buzzer on GPIO 4
+const int UP_BUTTON = 16;    // Button 1 on GPIO 16 (Up/Left Score)
+const int DOWN_BUTTON = 15;  // Button 2 on GPIO 15 (Down/Right Score/Select)
+const int LED_PIN = 2;       // Internal LED
+
+// Menu variables
+int menuIndex = 0;
+const int MENU_ITEMS = 5;    // Pong, Tone Guess, Toggle LED, Scoreboard, Trivia
+bool inMenu = true;
+unsigned long lastButtonPress = 0;
+const int DEBOUNCE_DELAY = 200;
+
+// Exit button variables
+unsigned long button1PressStart = 0;
+const unsigned long EXIT_HOLD_TIME = 3000; // 3 seconds
+
+// Game states
+enum GameState { MENU, PONG, TONE_GUESS, TOGGLE_LED, SCOREBOARD, TRIVIA };
+GameState currentState = MENU;
+
+// Pong variables
+const unsigned long PADDLE_RATE = 64;
+const unsigned long BALL_RATE = 16;
+const uint8_t PADDLE_HEIGHT = 12;
+const uint8_t SCORE_LIMIT = 9;
+bool pong_game_over, pong_win;
+uint8_t player_score, mcu_score;
+uint8_t ball_x = 53, ball_y = 26;
+uint8_t ball_dir_x = 1, ball_dir_y = 1;
+unsigned long ball_update;
+unsigned long paddle_update;
+const uint8_t MCU_X = 12;
+uint8_t mcu_y = 16;
+const uint8_t PLAYER_X = 115;
+uint8_t player_y = 16;
+
+// Tone Guess variables
+int round_number = 0;
+int correct_answers = 0;
+bool tone_game_over = false;
+bool waiting_for_guess = false;
+int current_freq = 0;
+int option_a = 0;
+int option_b = 0;
+const int frequencies[] = {100, 200, 300, 400, 500};
+
+// Scoreboard variables
+int scoreLeft = 0;
+int scoreRight = 0;
+unsigned long lastDebounceTimeLeft = 0;
+unsigned long lastDebounceTimeRight = 0;
+const unsigned long scoreDebounceDelay = 50;
+
+// Trivia variables
+struct Question {
+  const char* question;
+  const char* options[4];
+  uint8_t correct;
+};
+
+const Question questions[] PROGMEM = {
+  {"Capital Panama?", {"Colon", "David", "C. Panama", "Santiago"}, 2},
+  {"Separ. Colombia?", {"1903", "1910", "1898", "1921"}, 0},
+  {"Constitucion?", {"Leyes", "Ley suprema", "Tratado", "Derechos"}, 1},
+  {"No es gobierno?", {"Unitario", "Federal", "Republic.", "Democrat."}, 1},
+  {"Derecho indiv?", {"Seguridad", "Libertad", "Educacion", "Ecologico"}, 1},
+  {"Derecho social?", {"Transito", "Domicilio", "Educacion", "Peticion"}, 2},
+  {"Nacionalidad?", {"ID", "Vinculo", "Economico", "Militar"}, 1},
+  {"Edad adopcion?", {"7 anos", "18 anos", "21 anos", "Sin limite"}, 0},
+  {"Voto documento?", {"Pasaporte", "Cedula", "Licencia", "Nacim."}, 1},
+  {"Anios presid.?", {"4", "5", "6", "7"}, 1},
+  {"Organos estado?", {"Ejec.,Leg.,Jud.", "Pres.,Parl.,Jud.", "Ejec.,Elec.,Leg.", "Jud.,Mun.,Ejec."}, 0},
+  {"Edad min. pres.?", {"30", "35", "40", "45"}, 1},
+  {"Minist. educ.?", {"Minsa", "Meduca", "Mida", "Mirex"}, 1},
+  {"Diputados Asamb.?", {"60", "71", "80", "90"}, 1},
+  {"Edad min. dip.?", {"18", "21", "25", "30"}, 1},
+  {"Funcion judicial?", {"Hacer leyes", "Adm. justicia", "Org. elecc.", "Pol. publicas"}, 1},
+  {"Magistr. Corte?", {"7", "9", "11", "13"}, 1},
+  {"Alcalde elige?", {"Presidente", "Voto popular", "Asamblea", "Consejo Mun."}, 1},
+  {"Prov. ganadera?", {"Panama", "Los Santos", "Colon", "Cocle"}, 1},
+  {"Limite este?", {"Costa Rica", "Colombia", "Nicaragua", "Honduras"}, 1}
+};
+
+const uint8_t totalQuestions = 20;
+const uint8_t numQuestions = 10;
+uint8_t questionOrder[10];
+uint8_t currentQuestionIdx = 0;
+uint8_t score = 0;
+uint8_t selectedOption = 0;
+bool answered = false;
+unsigned long startTime;
+const uint32_t timeLimit = 15000; // 15 seconds
+unsigned long lastTimeBarUpdate = 0;
+const unsigned long TIME_BAR_UPDATE_INTERVAL = 100; // Update every 100ms
+bool triviaStarted = false; // Flag for intro animation
+bool questionDisplayed = false; // Flag to track if question is drawn
+
+// Panamanian anthem melody (simplified for buzzer)
+const int anthemNotes[] = {523, 659, 784, 659, 523, 587, 659, 523};
+const int anthemDurations[] = {400, 400, 400, 400, 400, 400, 400, 600};
+
+void setup() {
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(UP_BUTTON, INPUT_PULLUP);
+  pinMode(DOWN_BUTTON, INPUT_PULLUP);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(LED_PIN, LOW);
+
+  randomSeed(analogRead(0));
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    for(;;);
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  while (WiFi.waitForConnectResult() != WL_CONNECTED) {
+    delay(500);
+    ESP.restart();
+  }
+
+  ArduinoOTA
+    .onStart([]() {
+      display.clearDisplay();
+      display.setCursor(0, 0);
+      display.println("OTA Update Started");
+      display.display();
+      noTone(BUZZER_PIN);
+    })
+    .onEnd([]() {
+      display.println("OTA Update Complete!");
+      display.display();
+    })
+    .onProgress([](unsigned int progress, unsigned int total) {
+      display.clearDisplay();
+      display.setCursor(0, 0);
+      display.printf("Progress: %u%%\n", (progress / (total / 100)));
+      display.display();
+    })
+    .onError([](ota_error_t error) {
+      display.printf("Error[%u]: ", error);
+      display.display();
+    });
+
+  ArduinoOTA.begin();
+
+  updateMenuDisplay();
+  ball_update = millis();
+  paddle_update = ball_update;
+  shuffleQuestions();
+}
+
+void loop() {
+  ArduinoOTA.handle();
+
+  switch (currentState) {
+    case MENU:
+      handleMenu();
+      break;
+    case PONG:
+      playPong();
+      break;
+    case TONE_GUESS:
+      playToneGuess();
+      break;
+    case TOGGLE_LED:
+      toggleLED();
+      break;
+    case SCOREBOARD:
+      playScoreboard();
+      break;
+    case TRIVIA:
+      playTrivia();
+      break;
+  }
+}
+
+void handleMenu() {
+  bool button1Pressed = (digitalRead(UP_BUTTON) == LOW);
+  bool button2Pressed = (digitalRead(DOWN_BUTTON) == LOW);
+  unsigned long currentTime = millis();
+
+  if (button1Pressed && (currentTime - lastButtonPress > DEBOUNCE_DELAY)) {
+    menuIndex = (menuIndex + 1) % MENU_ITEMS;
+    lastButtonPress = currentTime;
+    updateMenuDisplay();
+    tone(BUZZER_PIN, 1000, 100);
+  }
+
+  if (button2Pressed && (currentTime - lastButtonPress > DEBOUNCE_DELAY)) {
+    lastButtonPress = currentTime;
+    tone(BUZZER_PIN, 1500, 100);
+    if (menuIndex == 0) {
+      currentState = PONG;
+      display.clearDisplay();
+      drawCourt();
+      display.display();
+      pong_game_over = false;
+      player_score = 0;
+      mcu_score = 0;
+    } else if (menuIndex == 1) {
+      currentState = TONE_GUESS;
+      resetToneGame();
+      startNewRound();
+    } else if (menuIndex == 2) {
+      currentState = TOGGLE_LED;
+    } else if (menuIndex == 3) {
+      currentState = SCOREBOARD;
+      scoreLeft = 0;
+      scoreRight = 0;
+      drawScoreboard();
+    } else if (menuIndex == 4) {
+      currentState = TRIVIA;
+      currentQuestionIdx = 0;
+      score = 0;
+      selectedOption = 0;
+      answered = false;
+      startTime = millis();
+      triviaStarted = false; // Reset for intro
+      questionDisplayed = false; // Reset question display
+    }
+  }
+}
+
+void updateMenuDisplay() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("=== GAMES ===");
+  display.println(menuIndex == 0 ? "> Pong" : "  Pong");
+  display.println(menuIndex == 1 ? "> Tone Guess" : "  Tone Guess");
+  display.println(menuIndex == 2 ? "> Toggle LED" : "  Toggle LED");
+  display.println(menuIndex == 3 ? "> Scoreboard" : "  Scoreboard");
+  display.println(menuIndex == 4 ? "> Trivia" : "  Trivia");
+  display.display();
+}
+
+// Pong functions
+void playPong() {
+  bool update_needed = false;
+  unsigned long time = millis();
+
+  static bool up_state = false;
+  static bool down_state = false;
+  
+  up_state |= (digitalRead(UP_BUTTON) == LOW);
+  down_state |= (digitalRead(DOWN_BUTTON) == LOW);
+
+  if (digitalRead(UP_BUTTON) == LOW) {
+    if (button1PressStart == 0) {
+      button1PressStart = millis();
+    } else if (millis() - button1PressStart >= EXIT_HOLD_TIME) {
+      currentState = MENU;
+      updateMenuDisplay();
+      tone(BUZZER_PIN, 800, 200);
+      button1PressStart = 0;
+      return;
+    }
+  } else {
+    button1PressStart = 0;
+  }
+
+  if (time > ball_update) {
+    uint8_t new_x = ball_x + ball_dir_x;
+    uint8_t new_y = ball_y + ball_dir_y;
+
+    if (new_x == 0 || new_x == 127) {
+      ball_dir_x = -ball_dir_x;
+      new_x += ball_dir_x + ball_dir_x;
+      digitalWrite(LED_PIN, HIGH);
+      if (new_x < 64) {
+        player_scoreTone();
+        player_score++;
+      } else {
+        mcu_scoreTone();
+        mcu_score++;
+      }
+      digitalWrite(LED_PIN, LOW);
+
+      if (player_score == SCORE_LIMIT || mcu_score == SCORE_LIMIT) {
+        pong_win = player_score > mcu_score;
+        pong_game_over = true;
+      }
+    }
+
+    if (new_y == 0 || new_y == 53) {
+      wallTone();
+      ball_dir_y = -ball_dir_y;
+      new_y += ball_dir_y + ball_dir_y;
+    }
+
+    if (new_x == MCU_X && new_y >= mcu_y && new_y <= mcu_y + PADDLE_HEIGHT) {
+      mcuPaddleTone();
+      ball_dir_x = -ball_dir_x;
+      new_x += ball_dir_x + ball_dir_x;
+    }
+
+    if (new_x == PLAYER_X && new_y >= player_y && new_y <= player_y + PADDLE_HEIGHT) {
+      playerPaddleTone();
+      ball_dir_x = -ball_dir_x;
+      new_x += ball_dir_x + ball_dir_x;
+    }
+
+    display.drawPixel(ball_x, ball_y, SSD1306_BLACK);
+    display.drawPixel(new_x, new_y, SSD1306_WHITE);
+    ball_x = new_x;
+    ball_y = new_y;
+    ball_update += BALL_RATE;
+    update_needed = true;
+  }
+
+  if (time > paddle_update) {
+    paddle_update += PADDLE_RATE;
+    display.drawFastVLine(MCU_X, mcu_y, PADDLE_HEIGHT, SSD1306_BLACK);
+    const uint8_t half_paddle = PADDLE_HEIGHT >> 1;
+    if (mcu_y + half_paddle > ball_y) {
+      int8_t dir = ball_x > MCU_X ? -1 : 1;
+      mcu_y += dir;
+    }
+    if (mcu_y + half_paddle < ball_y) {
+      int8_t dir = ball_x > MCU_X ? 1 : -1;
+      mcu_y += dir;
+    }
+    if (mcu_y < 1) mcu_y = 1;
+    if (mcu_y + PADDLE_HEIGHT > 53) mcu_y = 53 - PADDLE_HEIGHT;
+
+    display.drawFastVLine(MCU_X, mcu_y, PADDLE_HEIGHT, SSD1306_WHITE);
+    display.drawFastVLine(PLAYER_X, player_y, PADDLE_HEIGHT, SSD1306_BLACK);
+
+    if (up_state) player_y -= 1;
+    if (down_state) player_y += 1;
+    up_state = down_state = false;
+
+    if (player_y < 1) player_y = 1;
+    if (player_y + PADDLE_HEIGHT > 53) player_y = 53 - PADDLE_HEIGHT;
+
+    display.drawFastVLine(PLAYER_X, player_y, PADDLE_HEIGHT, SSD1306_WHITE);
+    update_needed = true;
+  }
+
+  if (update_needed) {
+    if (pong_game_over) {
+      const char* text = pong_win ? "YOU WIN!!" : "YOU LOSE!";
+      display.clearDisplay();
+      display.setCursor(40, 28);
+      display.print(text);
+      display.display();
+      delay(5000);
+
+      currentState = MENU;
+      ball_x = 53; ball_y = 26;
+      ball_dir_x = 1; ball_dir_y = 1;
+      mcu_y = 16; player_y = 16;
+      mcu_score = 0; player_score = 0;
+      pong_game_over = false;
+      updateMenuDisplay();
+      return;
+    }
+
+    display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+    display.setCursor(0, 56);
+    display.print(mcu_score);
+    display.setCursor(122, 56);
+    display.print(player_score);
+    display.display();
+  }
+}
+
+void playerPaddleTone() { tone(BUZZER_PIN, 250, 25); delay(25); }
+void mcuPaddleTone() { tone(BUZZER_PIN, 225, 25); delay(25); }
+void wallTone() { tone(BUZZER_PIN, 200, 25); delay(25); }
+void player_scoreTone() { tone(BUZZER_PIN, 200, 25); delay(50); tone(BUZZER_PIN, 250, 25); delay(25); }
+void mcu_scoreTone() { tone(BUZZER_PIN, 250, 25); delay(25); tone(BUZZER_PIN, 200, 25); delay(25); }
+void drawCourt() { display.drawRect(0, 0, 128, 54, SSD1306_WHITE); }
+
+// Tone Guess functions
+void playToneGuess() {
+  if (digitalRead(UP_BUTTON) == LOW) {
+    if (button1PressStart == 0) {
+      button1PressStart = millis();
+    } else if (millis() - button1PressStart >= EXIT_HOLD_TIME) {
+      currentState = MENU;
+      updateMenuDisplay();
+      tone(BUZZER_PIN, 800, 200);
+      button1PressStart = 0;
+      return;
+    }
+  } else {
+    button1PressStart = 0;
+  }
+
+  if (tone_game_over) {
+    showResults();
+    delay(5000);
+    currentState = MENU;
+    updateMenuDisplay();
+    return;
+  }
+
+  if (waiting_for_guess) {
+    if (digitalRead(UP_BUTTON) == LOW && millis() - button1PressStart < EXIT_HOLD_TIME) {
+      checkGuess(option_a);
+      while (digitalRead(UP_BUTTON) == LOW) delay(10);
+      waiting_for_guess = false;
+      startNewRound();
+    } else if (digitalRead(DOWN_BUTTON) == LOW) {
+      checkGuess(option_b);
+      while (digitalRead(DOWN_BUTTON) == LOW) delay(10);
+      waiting_for_guess = false;
+      startNewRound();
+    }
+  }
+}
+
+void startNewRound() {
+  if (round_number >= 5) {
+    tone_game_over = true;
+    return;
+  }
+
+  round_number++;
+  digitalWrite(LED_PIN, HIGH);
+
+  current_freq = frequencies[random(0, 5)];
+  option_a = current_freq;
+  option_b = frequencies[random(0, 5)];
+  while (option_b == option_a) {
+    option_b = frequencies[random(0, 5)];
+  }
+
+  tone(BUZZER_PIN, current_freq, 500);
+  delay(600);
+  digitalWrite(LED_PIN, LOW);
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print("Round ");
+  display.println(round_number);
+  display.setCursor(0, 20);
+  display.print("A: ");
+  display.print(option_a);
+  display.println(" Hz (UP)");
+  display.setCursor(0, 40);
+  display.print("B: ");
+  display.print(option_b);
+  display.println(" Hz (DOWN)");
+  display.display();
+
+  waiting_for_guess = true;
+}
+
+void checkGuess(int guess) {
+  display.clearDisplay();
+  display.setCursor(0, 20);
+  if (guess == current_freq) {
+    display.println("Correct!");
+    correct_answers++;
+    tone(BUZZER_PIN, 500, 200);
+  } else {
+    display.print("Wrong! It was ");
+    display.print(current_freq);
+    display.println(" Hz");
+    tone(BUZZER_PIN, 200, 200);
+  }
+  display.display();
+  delay(2000);
+}
+
+void showResults() {
+  display.clearDisplay();
+  display.setCursor(0, 20);
+  display.print("Game Over! Score: ");
+  display.print(correct_answers);
+  display.println("/5");
+  display.display();
+}
+
+void resetToneGame() {
+  round_number = 0;
+  correct_answers = 0;
+  tone_game_over = false;
+  waiting_for_guess = false;
+}
+
+// Toggle LED function
+void toggleLED() {
+  if (digitalRead(UP_BUTTON) == LOW) {
+    if (button1PressStart == 0) {
+      button1PressStart = millis();
+    } else if (millis() - button1PressStart >= EXIT_HOLD_TIME) {
+      currentState = MENU;
+      updateMenuDisplay();
+      tone(BUZZER_PIN, 800, 200);
+      button1PressStart = 0;
+      return;
+    }
+  } else {
+    button1PressStart = 0;
+  }
+
+  digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 20);
+  display.print("LED: ");
+  display.println(digitalRead(LED_PIN) ? "ON" : "OFF");
+  display.display();
+  delay(1000);
+  currentState = MENU;
+  updateMenuDisplay();
+}
+
+// Scoreboard functions
+void playScoreboard() {
+  if (digitalRead(UP_BUTTON) == LOW) {
+    if (button1PressStart == 0) {
+      button1PressStart = millis();
+    } else if (millis() - button1PressStart >= EXIT_HOLD_TIME) {
+      currentState = MENU;
+      updateMenuDisplay();
+      tone(BUZZER_PIN, 800, 200);
+      button1PressStart = 0;
+      return;
+    }
+  } else {
+    button1PressStart = 0;
+  }
+
+  static int lastButtonStateLeft = HIGH;
+  int buttonStateLeft = digitalRead(UP_BUTTON);
+  if (buttonStateLeft != lastButtonStateLeft) {
+    if (millis() - lastDebounceTimeLeft > scoreDebounceDelay) {
+      if (buttonStateLeft == LOW && millis() - button1PressStart < EXIT_HOLD_TIME) {
+        scoreLeft++;
+        if (scoreLeft > 99) scoreLeft = 0;
+        playBeep(500, 100);
+        drawScoreboard();
+      }
+      lastDebounceTimeLeft = millis();
+    }
+  }
+  lastButtonStateLeft = buttonStateLeft;
+
+  static int lastButtonStateRight = HIGH;
+  int buttonStateRight = digitalRead(DOWN_BUTTON);
+  if (buttonStateRight != lastButtonStateRight) {
+    if (millis() - lastDebounceTimeRight > scoreDebounceDelay) {
+      if (buttonStateRight == LOW) {
+        scoreRight++;
+        if (scoreRight > 99) scoreRight = 0;
+        playBeep(1000, 100);
+        drawScoreboard();
+      }
+      lastDebounceTimeRight = millis();
+    }
+  }
+  lastButtonStateRight = buttonStateRight;
+}
+
+void drawScoreboard() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(4);
+  display.setCursor(10, 20);
+  if (scoreLeft < 10) display.print("0");
+  display.print(scoreLeft);
+  display.fillRect(SCREEN_WIDTH / 2, 0, SCREEN_WIDTH / 2, SCREEN_HEIGHT, SSD1306_WHITE);
+  display.setTextColor(SSD1306_BLACK);
+  display.setTextSize(4);
+  display.setCursor(74, 20);
+  if (scoreRight < 10) display.print("0");
+  display.print(scoreRight);
+  display.drawLine(SCREEN_WIDTH / 2, 0, SCREEN_WIDTH / 2, SCREEN_HEIGHT, SSD1306_WHITE);
+  display.display();
+}
+
+void playBeep(int frequency, int duration) {
+  tone(BUZZER_PIN, frequency, duration);
+  delay(duration);
+  noTone(BUZZER_PIN);
+}
+
+// Trivia intro animation
+void playTriviaIntro() {
+  // Part 1: Draw Panamanian flag (simplified for OLED)
+  for (int x = 0; x <= SCREEN_WIDTH; x += 4) {
+    display.clearDisplay();
+    // Top-left white with stars
+    display.fillRect(0, 0, x / 2, SCREEN_HEIGHT / 2, SSD1306_WHITE);
+    display.fillCircle(x / 4, SCREEN_HEIGHT / 4, 3, SSD1306_BLACK); // Blue star
+    // Top-right red
+    display.fillRect(x / 2, 0, x / 2, SCREEN_HEIGHT / 2, SSD1306_WHITE);
+    // Bottom-left blue
+    display.fillRect(0, SCREEN_HEIGHT / 2, x / 2, SCREEN_HEIGHT / 2, SSD1306_WHITE);
+    // Bottom-right white with star
+    display.fillRect(x / 2, SCREEN_HEIGHT / 2, x / 2, SCREEN_HEIGHT / 2, SSD1306_WHITE);
+    display.fillCircle(3 * x / 4, 3 * SCREEN_HEIGHT / 4, 3, SSD1306_BLACK); // Red star
+    display.display();
+    delay(30);
+  }
+
+  // Play anthem melody
+  for (int i = 0; i < 8; i++) {
+    tone(BUZZER_PIN, anthemNotes[i], anthemDurations[i]);
+    delay(anthemDurations[i] + 50);
+  }
+  noTone(BUZZER_PIN);
+
+  // Part 2: Show "¡Viva Panamá!" text
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(20, 20);
+  display.println("!Viva Panama!");
+  display.setCursor(10, 40);
+  display.println("Trivia Patriotica");
+  display.display();
+  delay(2000);
+
+  // Flash LED for effect
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(100);
+    digitalWrite(LED_PIN, LOW);
+    delay(100);
+  }
+}
+
+// Trivia functions
+void playTrivia() {
+  // Play intro animation once
+  if (!triviaStarted) {
+    playTriviaIntro();
+    triviaStarted = true;
+    shuffleQuestions();
+    questionDisplayed = false; // Ensure question is drawn
+    showQuestion(true); // Force full draw
+  }
+
+  if (!answered && millis() - startTime >= timeLimit) {
+    checkAnswer(255);
+    return;
+  }
+
+  if (digitalRead(UP_BUTTON) == LOW) {
+    if (button1PressStart == 0) {
+      button1PressStart = millis();
+    } else if (millis() - button1PressStart >= EXIT_HOLD_TIME) {
+      currentState = MENU;
+      updateMenuDisplay();
+      tone(BUZZER_PIN, 800, 200);
+      button1PressStart = 0;
+      triviaStarted = false; // Reset for next time
+      questionDisplayed = false; // Reset question display
+      return;
+    }
+  } else {
+    button1PressStart = 0;
+  }
+
+  // Update time bar continuously
+  unsigned long currentTime = millis();
+  if (currentTime - lastTimeBarUpdate >= TIME_BAR_UPDATE_INTERVAL && !answered) {
+    showQuestion(false); // Update only time bar
+    lastTimeBarUpdate = currentTime;
+  }
+
+  if (!answered) {
+    static unsigned long lastSelectionChange = 0;
+    if (digitalRead(UP_BUTTON) == LOW && millis() - button1PressStart < EXIT_HOLD_TIME && 
+        currentTime - lastSelectionChange > DEBOUNCE_DELAY) {
+      selectedOption = (selectedOption + 1) % 4;
+      showQuestion(true); // Update question with new selection
+      tone(BUZZER_PIN, 1200, 50); // Selection tone
+      lastSelectionChange = currentTime;
+    }
+    if (digitalRead(DOWN_BUTTON) == LOW && currentTime - lastSelectionChange > DEBOUNCE_DELAY) {
+      checkAnswer(selectedOption);
+      tone(BUZZER_PIN, 1500, 100); // Confirmation tone
+      lastSelectionChange = currentTime;
+    }
+  }
+}
+
+void shuffleQuestions() {
+  uint8_t indices[totalQuestions];
+  for (uint8_t i = 0; i < totalQuestions; i++) {
+    indices[i] = i;
+  }
+  
+  for (uint8_t i = totalQuestions - 1; i > 0; i--) {
+    randomSeed(analogRead(0) + micros());
+    uint8_t j = random(0, i + 1);
+    uint8_t temp = indices[i];
+    indices[i] = indices[j];
+    indices[j] = temp;
+  }
+  
+  for (uint8_t i = 0; i < numQuestions; i++) {
+    questionOrder[i] = indices[i];
+  }
+}
+
+void showQuestion(bool fullUpdate) {
+  // Full update: draw question, options, and time bar
+  if (fullUpdate || !questionDisplayed) {
+    display.clearDisplay();
+    char qBuffer[21];
+    char oBuffer[21];
+    Question q;
+    uint8_t qIdx = questionOrder[currentQuestionIdx];
+    memcpy_P(&q, &questions[qIdx], sizeof(Question));
+
+    strncpy_P(qBuffer, q.question, 20);
+    qBuffer[20] = '\0';
+    display.setCursor(0, 0);
+    display.print(qBuffer);
+
+    for (uint8_t i = 0; i < 4; i++) {
+      strncpy_P(oBuffer, q.options[i], 20);
+      oBuffer[20] = '\0';
+      display.setCursor(0, 16 + i * 8);
+      if (i == selectedOption) {
+        display.print(">");
+      } else {
+        display.print(" ");
+      }
+      display.print(oBuffer);
+    }
+    questionDisplayed = true;
+  }
+
+  // Always update time bar
+  uint32_t elapsed = millis() - startTime;
+  uint8_t barWidth = map(timeLimit - elapsed, 0, timeLimit, 0, SCREEN_WIDTH);
+  if (barWidth > SCREEN_WIDTH) barWidth = SCREEN_WIDTH;
+  display.fillRect(0, 8, SCREEN_WIDTH, 4, SSD1306_BLACK); // Clear old bar
+  display.fillRect(0, 8, barWidth, 4, SSD1306_WHITE);    // Draw new bar
+
+  display.display();
+}
+
+void checkAnswer(uint8_t answer) {
+  answered = true;
+  questionDisplayed = false; // Reset for next question
+  Question q;
+  uint8_t qIdx = questionOrder[currentQuestionIdx];
+  memcpy_P(&q, &questions[qIdx], sizeof(Question));
+
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  if (answer == q.correct && answer != 255) {
+    score++;
+    display.print("Correcto!");
+    digitalWrite(LED_PIN, HIGH);
+    tone(BUZZER_PIN, 1000, 500);
+    delay(500);
+    digitalWrite(LED_PIN, LOW);
+  } else {
+    display.print(answer == 255 ? "Tiempo agotado!" : "Incorrecto!");
+    char cBuffer[21];
+    strncpy_P(cBuffer, q.options[q.correct], 20);
+    cBuffer[20] = '\0';
+    display.setCursor(0, 16);
+    display.print("R: ");
+    display.print(cBuffer);
+    digitalWrite(LED_PIN, HIGH);
+    tone(BUZZER_PIN, 200, 500);
+    delay(500);
+    digitalWrite(LED_PIN, LOW);
+  }
+  display.display();
+
+  delay(2000);
+  currentQuestionIdx++;
+  selectedOption = 0;
+  answered = false;
+  startTime = millis();
+
+  if (currentQuestionIdx < numQuestions) {
+    showQuestion(true); // Full update for new question
+  } else {
+    showTriviaResults();
+  }
+}
+
+void showTriviaResults() {
+  questionDisplayed = false; // Reset for next game
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.print("Puntuacion: ");
+  display.print(score);
+  display.print("/");
+  display.print(numQuestions);
+  display.setCursor(0, 16);
+  display.print("Btn 2: Reiniciar");
+  display.display();
+
+  while (true) {
+    if (digitalRead(DOWN_BUTTON) == LOW) {
+      currentQuestionIdx = 0;
+      score = 0;
+      selectedOption = 0;
+      answered = false;
+      shuffleQuestions();
+      startTime = millis();
+      triviaStarted = false; // Play intro again
+      delay(200);
+      break;
+    }
+    if (digitalRead(UP_BUTTON) == LOW) {
+      if (button1PressStart == 0) {
+        button1PressStart = millis();
+      } else if (millis() - button1PressStart >= EXIT_HOLD_TIME) {
+        currentState = MENU;
+        updateMenuDisplay();
+        tone(BUZZER_PIN, 800, 200);
+        button1PressStart = 0;
+        triviaStarted = false; // Reset for next time
+        return;
+      }
+    } else {
+      button1PressStart = 0;
+    }
+  }
+}
